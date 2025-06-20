@@ -2,8 +2,11 @@ import chess
 import chess.pgn
 import numpy as np
 import pygame
-import torch
+import os
+from pathlib import Path
+import time
 from pprint import pprint
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -47,8 +50,32 @@ def result_to_label(result_str, board: chess.Board):
 def extract_labeled_positions_from_pgn(pgn_file_path, max_positions_per_game=30):
     X, y = [], []
     num_boards_read = 0
+
+    offsets_of_games = []
+    min_elo = 1800
+    num_games_total = 0
+
+    t_before = time.time()
     with open(pgn_file_path) as pgn_file:
         while True:
+            num_games_total += 1
+            cur_offset = pgn_file.tell()
+            headers = chess.pgn.read_headers(pgn_file)
+            if headers is None:
+                break
+            elo_black = int(headers.get("BlackElo"))
+            elo_white = int(headers.get("WhiteElo"))
+            if elo_black < min_elo or elo_white < min_elo:
+                continue
+            offsets_of_games.append(cur_offset)
+    t_after = time.time()
+    print(
+        f"ELO limit {min_elo}. Keeping {len(offsets_of_games)}/{num_games_total} games. Took {t_after-t_before} seconds"
+    )
+
+    with open(pgn_file_path) as pgn_file:
+        for cur_offset in offsets_of_games:
+            pgn_file.seek(cur_offset)
             game = chess.pgn.read_game(pgn_file)
             if game is None:
                 break
@@ -71,9 +98,6 @@ def extract_labeled_positions_from_pgn(pgn_file_path, max_positions_per_game=30)
             num_boards_read += 1
             if num_boards_read % 1000 == 0:
                 print(f"Processed {num_boards_read} games...")
-            if num_boards_read >= 100:  # Limit for testing
-                print("Reached 10,000 games limit for testing.")
-                break
     return np.array(X), np.array(y)
 
 
@@ -109,36 +133,63 @@ class ChessPositionNet(nn.Module):
 
 
 # --- Step 6: Training ---
-def train_model(pgn_file_path, batch_size=64, epochs=10):
+def train_model(pgn_file_path, batch_size=256, epochs=10):
+    import os
     import time
 
     print("Loading data...")
+    dir_cache = "cache"
+    Path(dir_cache).mkdir(parents=True, exist_ok=True)
+    input_stem = Path(pgn_file_path).stem
+    fn_dataset = Path(dir_cache).joinpath(input_stem + ".dataset")
+
     t_start = time.time()
-    X, y = extract_labeled_positions_from_pgn(pgn_file_path)
-    print("Got here")
-    dataset = ChessPositionDataset(X, y)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    if os.path.exists(fn_dataset):
+        print(f"Found cached dataset {fn_dataset}")
+        dataset = torch.load(fn_dataset, weights_only=False)
+    else:
+        print("Generating new dataset")
+        X, y = extract_labeled_positions_from_pgn(pgn_file_path)
+        dataset = ChessPositionDataset(X, y)
+        torch.save(dataset, fn_dataset)
+
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, pin_memory=True
+    )
     t_end = time.time()
     print("Done loading data in {:.2f} seconds".format(t_end - t_start))
+
+    print("CUDA available:", torch.cuda.is_available())
+    print("CUDA device count:", torch.cuda.device_count())
+    print("Current device:", torch.cuda.current_device())
+    print(
+        "Device name:",
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     model = ChessPositionNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.BCELoss()
-
+    num_samples = len(dataloader.dataset)
     for epoch in range(epochs):
         total_loss = 0.0
         t_start = time.time()
-        for inputs, labels in dataloader:
+        for idx, (inputs, labels) in enumerate(dataloader):
             inputs = inputs.to(device)
-            labels = labels.to(device)
+            labels = labels.float().to(device)
             outputs = model(inputs)
             loss = criterion(outputs.squeeze(), labels)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            if (idx + 1) % 1000 == 0:
+                print(
+                    f"Epoch {epoch}/{epochs}, batch {idx+1}/{num_samples//batch_size}, Loss: {loss.item():.4f}"
+                )
         t_end = time.time()
         t_tot = t_end - t_start
         print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Time: {t_tot:.2f} seconds")
@@ -254,34 +305,37 @@ def interactive_chess_board(trained_model: ChessPositionNet):
     pygame.quit()
 
 
-def ensure_model(fn: str):
+def ensure_model(fn_input: str):
     """
     Ensure the model file exists.
     If not, train a new model and save it.
     """
-    import os
-    from pathlib import Path
 
-    # input_file = "data/lichess_db_standard_rated_2015-04.pgn"
-    input_file = "data/small.pgn"
-    if not os.path.exists(fn):
-        print(f"Model file {fn} does not exist. Training a new model...")
-        trained_model = train_model(input_file, epochs=100)
-        Path(os.path.dirname(fn)).mkdir(parents=True, exist_ok=True)
-        torch.save(trained_model.state_dict(), fn)
-        print(f"Model saved to {fn}")
+    dir_models = "models"
+    stem = Path(fn_input).stem
+    fn_model = Path(dir_models).joinpath(stem + ".pth")
+
+    if not os.path.exists(fn_model):
+        print(f"Model file {fn_model} does not exist. Training a new model...")
+        trained_model = train_model(fn_input, epochs=100)
+        Path(os.path.dirname(fn_model)).mkdir(parents=True, exist_ok=True)
+        torch.save(trained_model.state_dict(), fn_model)
+        print(f"Model saved to {fn_model}")
     else:
+        print(f"Loading existing model {fn_model}")
         trained_model = ChessPositionNet()
-        trained_model.load_state_dict(torch.load(fn, weights_only=True))
+        trained_model.load_state_dict(torch.load(fn_model, weights_only=True))
         trained_model.eval()
-        print(f"Model file {fn} already exists.")
 
     return trained_model
 
 
 # --- Entry Point ---
 if __name__ == "__main__":
-    trained_model = ensure_model("models/chess_model.pth")
+    dir_data = "data"
+    fn_input = Path(dir_data).joinpath("lichess_db_standard_rated_2015-04.pgn")
+    # fn_input = Path(dir_data).joinpath("small.pgn")
+    trained_model = ensure_model(fn_input)
 
     interactive_chess_board(trained_model)
     # TODO:
