@@ -80,6 +80,10 @@ def extract_labeled_positions_from_pgn(pgn_file_path, max_positions_per_game=100
             headers = chess.pgn.read_headers(pgn_file)
             if headers is None:
                 break
+            if (not headers.get("WhiteElo").isnumeric()) or (
+                not headers.get("BlackElo").isnumeric()
+            ):
+                continue
             elo_black = int(headers.get("BlackElo"))
             elo_white = int(headers.get("WhiteElo"))
             if elo_black < min_elo or elo_white < min_elo:
@@ -136,13 +140,17 @@ class ChessPositionNet(nn.Module):
     def __init__(self):
         super(ChessPositionNet, self).__init__()
         num_planes = 13
-        self.conv1 = nn.Conv2d(num_planes, 32, kernel_size=3, padding=1)
+        out_channels_first = 256
+        out_channels_second = 256
+        self.conv1 = nn.Conv2d(num_planes, out_channels_first, kernel_size=3, padding=1)
         self.relu1 = nn.ReLU()
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(
+            out_channels_first, out_channels_second, kernel_size=3, padding=1
+        )
         self.relu2 = nn.ReLU()
         self.pool = nn.MaxPool2d(kernel_size=2)
         self.fc1 = nn.Linear(
-            64 * 4 * 4, 128
+            out_channels_second * 4 * 4, 128
         )  # assuming input size 8x8, after pooling 4x4
         self.relu3 = nn.ReLU()
         self.fc2 = nn.Linear(128, 1)  # output could be a value estimate or move score
@@ -339,6 +347,10 @@ def interactive_chess_board(trained_model: ChessPositionNet):
         # move()
         draw_board()
         draw_pieces()
+        if board.is_game_over(claim_draw=True):
+            font = pygame.font.Font(None, 74)
+            text = font.render("Game Over", True, (255, 0, 0))
+            screen.blit(text, (WIDTH // 2 - text.get_width() // 2, HEIGHT // 2))
         pygame.display.flip()
 
     pygame.quit()
@@ -353,10 +365,11 @@ def ensure_model(fn_input: str):
     dir_models = "models"
     stem = Path(fn_input).stem
     fn_model = Path(dir_models).joinpath(stem + ".pth")
+    num_epochs = 100
 
     if not os.path.exists(fn_model):
         print(f"Model file {fn_model} does not exist. Training a new model...")
-        trained_model = train_model(fn_input, epochs=100)
+        trained_model = train_model(fn_input, epochs=num_epochs)
         Path(os.path.dirname(fn_model)).mkdir(parents=True, exist_ok=True)
         torch.save(trained_model.state_dict(), fn_model)
         print(f"Model saved to {fn_model}")
@@ -373,7 +386,8 @@ def ensure_model(fn_input: str):
 if __name__ == "__main__":
     dir_data = "data"
     # fn_input = Path(dir_data).joinpath("lichess_db_standard_rated_2015-04.pgn")
-    fn_input = Path(dir_data).joinpath("small.pgn")
+    fn_input = Path(dir_data).joinpath("lichess_db_standard_rated_2013-11.pgn")
+    # fn_input = Path(dir_data).joinpath("small.pgn")
     trained_model = ensure_model(fn_input)
 
     interactive_chess_board(trained_model)
