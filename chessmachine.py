@@ -14,40 +14,57 @@ from torch.utils.data import Dataset, DataLoader
 
 # --- Step 1: Board to Tensor ---
 def board_to_tensor(board: chess.Board) -> np.ndarray:
-    tensor = np.zeros((12, 8, 8), dtype=np.float32)
-    piece_map = {
-        chess.PAWN: 0,
-        chess.KNIGHT: 1,
-        chess.BISHOP: 2,
-        chess.ROOK: 3,
-        chess.QUEEN: 4,
-        chess.KING: 5,
-    }
+    num_piece_types = len(chess.PIECE_TYPES)  # 6 types of pieces
+    num_players = 2
+    num_rows = 8
+    num_cols = 8
+    num_extra_feature_planes = 1
+    num_planes = num_players * num_piece_types + num_extra_feature_planes
+    idx_features_plane = num_planes - 1
+    tensor = np.zeros((num_planes, num_rows, num_cols), dtype=np.float32)
+
+    color_current_move = board.turn
+    color_next_move = not color_current_move
+
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece:
+            idx_piece = piece.piece_type - 1
             row = 7 - (square // 8)
             col = square % 8
-            plane = piece_map[piece.piece_type] + (
-                6 if piece.color == chess.BLACK else 0
-            )
+            plane = idx_piece + (6 if piece.color == color_next_move else 0)
             tensor[plane, row, col] = 1.0
+
+    # Add extra flags for the current move
+    tensor[idx_features_plane, 0, 0] = (
+        1.0 if board.has_kingside_castling_rights(color_current_move) else 0.0
+    )
+    tensor[idx_features_plane, 0, 1] = (
+        1.0 if board.has_queenside_castling_rights(color_current_move) else 0.0
+    )
+    tensor[idx_features_plane, 0, 2] = (
+        1.0 if board.has_kingside_castling_rights(color_next_move) else 0.0
+    )
+    tensor[idx_features_plane, 0, 3] = (
+        1.0 if board.has_queenside_castling_rights(color_next_move) else 0.0
+    )
+
     return tensor
 
 
 # --- Step 2: Result to Label ---
 def result_to_label(result_str, board: chess.Board):
     if result_str == "1-0":
-        return 1 if board.turn == chess.WHITE else 0
+        return 1 if board.turn == chess.WHITE else -1
     elif result_str == "0-1":
-        return 1 if board.turn == chess.BLACK else 0
+        return 1 if board.turn == chess.BLACK else -1
     elif result_str == "1/2-1/2":
         return 0
     return None
 
 
 # --- Step 3: PGN Parsing ---
-def extract_labeled_positions_from_pgn(pgn_file_path, max_positions_per_game=30):
+def extract_labeled_positions_from_pgn(pgn_file_path, max_positions_per_game=1000):
     X, y = [], []
     num_boards_read = 0
 
@@ -70,7 +87,7 @@ def extract_labeled_positions_from_pgn(pgn_file_path, max_positions_per_game=30)
             offsets_of_games.append(cur_offset)
     t_after = time.time()
     print(
-        f"ELO limit {min_elo}. Keeping {len(offsets_of_games)}/{num_games_total} games. Took {t_after-t_before} seconds"
+        f"ELO limit {min_elo}. Keeping {len(offsets_of_games)}/{num_games_total} games. Took {t_after-t_before:.2f} seconds"
     )
 
     with open(pgn_file_path) as pgn_file:
@@ -117,13 +134,34 @@ class ChessPositionDataset(Dataset):
 # --- Step 5: Model ---
 class ChessPositionNet(nn.Module):
     def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(12, 32, kernel_size=3, padding=1)
+        super(ChessPositionNet, self).__init__()
+        num_planes = 13
+        self.conv1 = nn.Conv2d(num_planes, 32, kernel_size=3, padding=1)
+        self.relu1 = nn.ReLU()
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.fc1 = nn.Linear(64 * 8 * 8, 128)
-        self.fc2 = nn.Linear(128, 1)
+        self.relu2 = nn.ReLU()
+        self.pool = nn.MaxPool2d(kernel_size=2)
+        self.fc1 = nn.Linear(
+            64 * 4 * 4, 128
+        )  # assuming input size 8x8, after pooling 4x4
+        self.relu3 = nn.ReLU()
+        self.fc2 = nn.Linear(128, 1)  # output could be a value estimate or move score
+        ## From ChatGPT:
+        # super().__init__()
+        # self.conv1 = nn.Conv2d(12, 32, kernel_size=3, padding=1)
+        # self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        # self.fc1 = nn.Linear(64 * 8 * 8, 128)
+        # self.fc2 = nn.Linear(128, 1)
 
     def forward(self, x):
+        x = self.relu1(self.conv1(x))
+        x = self.relu2(self.conv2(x))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.relu3(self.fc1(x))
+        output = torch.tanh(self.fc2(x))
+        return output
+        ## From ChatGPT:
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = x.view(x.size(0), -1)
@@ -172,7 +210,7 @@ def train_model(pgn_file_path, batch_size=256, epochs=10):
     print(f"Using device: {device}")
     model = ChessPositionNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.BCELoss()
+    criterion = nn.MSELoss()
     num_samples = len(dataloader.dataset)
     for epoch in range(epochs):
         total_loss = 0.0
@@ -261,6 +299,7 @@ def interactive_chess_board(trained_model: ChessPositionNet):
         cur_best_move = None
         can_claim_draw = False
         the_draw_move = None
+        num_planes = 13
         for cur_move in board.legal_moves:
             board.push(cur_move)
             if board.can_claim_draw():
@@ -271,7 +310,7 @@ def interactive_chess_board(trained_model: ChessPositionNet):
                 print("Can claim draw with move: ", the_draw_move)
                 continue
             input_tensor = torch.tensor(
-                board_to_tensor(board).reshape(1, 12, 8, 8), dtype=torch.float32
+                board_to_tensor(board).reshape(1, num_planes, 8, 8), dtype=torch.float32
             ).to(next(trained_model.parameters()).device)
             cur_output = trained_model.forward(input_tensor)
             if cur_output > cur_best_output:
@@ -333,8 +372,8 @@ def ensure_model(fn_input: str):
 # --- Entry Point ---
 if __name__ == "__main__":
     dir_data = "data"
-    fn_input = Path(dir_data).joinpath("lichess_db_standard_rated_2015-04.pgn")
-    # fn_input = Path(dir_data).joinpath("small.pgn")
+    # fn_input = Path(dir_data).joinpath("lichess_db_standard_rated_2015-04.pgn")
+    fn_input = Path(dir_data).joinpath("small.pgn")
     trained_model = ensure_model(fn_input)
 
     interactive_chess_board(trained_model)
