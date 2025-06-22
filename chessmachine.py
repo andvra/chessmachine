@@ -220,6 +220,7 @@ def train_model(pgn_file_path, batch_size=256, epochs=10):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     num_samples = len(dataloader.dataset)
+    num_batches = num_samples // batch_size
     for epoch in range(epochs):
         total_loss = 0.0
         t_start = time.time()
@@ -232,13 +233,15 @@ def train_model(pgn_file_path, batch_size=256, epochs=10):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-            if (idx + 1) % 1000 == 0:
-                print(
-                    f"Epoch {epoch}/{epochs}, batch {idx+1}/{num_samples//batch_size}, Loss: {loss.item():.4f}"
-                )
+            # if (idx + 1) % 1000 == 0:
+            #     print(
+            #         f"Epoch {epoch}/{epochs}, batch {idx+1}/{num_batches}, Loss: {loss.item():.4f}"
+            #     )
         t_end = time.time()
         t_tot = t_end - t_start
-        print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Time: {t_tot:.2f} seconds")
+        print(
+            f"Epoch {epoch+1}, Avg. loss: {total_loss/num_batches:.4f}, Time: {t_tot:.2f} seconds"
+        )
 
     return model
 
