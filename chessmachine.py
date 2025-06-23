@@ -240,7 +240,7 @@ def train_model(pgn_file_path, batch_size=256, epochs=10):
         t_end = time.time()
         t_tot = t_end - t_start
         print(
-            f"Epoch {epoch+1}, Avg. loss: {total_loss/num_batches:.4f}, Time: {t_tot:.2f} seconds"
+            f"Epoch {epoch+1}/{epochs}, Avg. loss: {total_loss/num_batches:.4f}, Time: {t_tot:.2f} seconds"
         )
 
     return model
